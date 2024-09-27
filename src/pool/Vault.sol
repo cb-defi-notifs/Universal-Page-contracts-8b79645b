@@ -4,27 +4,12 @@ pragma solidity =0.8.22;
 import {OwnableUnset} from "@erc725/smart-contracts/contracts/custom/OwnableUnset.sol";
 import {ReentrancyGuardUpgradeable} from "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import {PausableUpgradeable} from "@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol";
+import {ERC165} from "openzeppelin-contracts/contracts/utils/introspection/ERC165.sol";
+import {ERC165Checker} from "openzeppelin-contracts/contracts/utils/introspection/ERC165Checker.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IDepositContract, DEPOSIT_AMOUNT} from "./IDepositContract.sol";
 
-contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable {
-    uint32 private constant _FEE_BASIS = 100_000;
-    uint32 private constant _MIN_FEE = 0; // 0%
-    uint32 private constant _MAX_FEE = 15_000; // 15%
-    uint256 private constant _MAX_VALIDATORS_SUPPORTED = 1_000_000;
-
-    error InvalidAmount(uint256 amount);
-    error WithdrawalFailed(address account, address beneficiary, uint256 amount);
-    error ClaimFailed(address account, address beneficiary, uint256 amount);
-    error DepositLimitExceeded(uint256 totalValue, uint256 depositLimit);
-    error CallerNotOracle(address account);
-    error InsufficientBalance(uint256 availableAmount, uint256 requestedAmount);
-    error CallerNotFeeRecipient(address account);
-    error FeeClaimFailed(address account, address beneficiary, uint256 amount);
-    error InvalidAddress(address account);
-    error ValidatorAlreadyRegistered(bytes pubkey);
-    error CallerNotOperator(address account);
-
+interface IVault {
     event Deposited(address indexed account, address indexed beneficiary, uint256 amount);
     event Withdrawn(address indexed account, address indexed beneficiary, uint256 amount);
     event WithdrawalRequested(address indexed account, address indexed beneficiary, uint256 amount);
@@ -38,6 +23,57 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
     event Rebalanced(
         uint256 previousTotalStaked, uint256 previousTotalUnstaked, uint256 totalStaked, uint256 totalUnstaked
     );
+    event StakeTransferred(address indexed from, address indexed to, uint256 amount, bytes data);
+
+    function depositLimit() external view returns (uint256);
+    function totalAssets() external view returns (uint256);
+    function totalShares() external view returns (uint256);
+    function totalStaked() external view returns (uint256);
+    function totalUnstaked() external view returns (uint256);
+    function totalPendingWithdrawal() external view returns (uint256);
+    function totalValidatorsRegistered() external view returns (uint256);
+    function fee() external view returns (uint32);
+    function feeRecipient() external view returns (address);
+    function totalFees() external view returns (uint256);
+    function restricted() external view returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+    function sharesOf(address account) external view returns (uint256);
+    function pendingBalanceOf(address account) external view returns (uint256);
+    function claimableBalanceOf(address account) external view returns (uint256);
+    function deposit(address beneficiary) external payable;
+    function withdraw(uint256 amount, address beneficiary) external;
+    function claim(uint256 amount, address beneficiary) external;
+    function claimFees(uint256 amount, address beneficiary) external;
+    function transferStake(address to, uint256 amount, bytes calldata data) external;
+}
+
+interface IVaultStakeRecipient {
+    /// @notice Amount of stake have been transfered to the recipient.
+    /// @param from The address of the sender.
+    /// @param amount The amount of stake.
+    /// @param data Additional data.
+    function onVaultStakeReceived(address from, uint256 amount, bytes calldata data) external;
+}
+
+contract Vault is IVault, ERC165, OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable {
+    uint32 private constant _FEE_BASIS = 100_000;
+    uint32 private constant _MIN_FEE = 0; // 0%
+    uint32 private constant _MAX_FEE = 15_000; // 15%
+    uint256 private constant _MAX_VALIDATORS_SUPPORTED = 1_000_000;
+    uint256 private constant _MINIMUM_REQUIRED_SHARES = 1e3;
+
+    error InvalidAmount(uint256 amount);
+    error WithdrawalFailed(address account, address beneficiary, uint256 amount);
+    error ClaimFailed(address account, address beneficiary, uint256 amount);
+    error DepositLimitExceeded(uint256 totalValue, uint256 depositLimit);
+    error CallerNotOracle(address account);
+    error InsufficientBalance(uint256 availableAmount, uint256 requestedAmount);
+    error CallerNotFeeRecipient(address account);
+    error FeeClaimFailed(address account, address beneficiary, uint256 amount);
+    error InvalidAddress(address account);
+    error ValidatorAlreadyRegistered(bytes pubkey);
+    error CallerNotOperator(address account);
+    error InvalidSignature();
 
     // limit of total deposits in wei.
     // This limits the total number of validators that can be registered.
@@ -83,6 +119,10 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
 
     constructor() {
         _disableInitializers();
+    }
+
+    function supportsInterface(bytes4 interfaceId) public view override returns (bool) {
+        return interfaceId == type(IVault).interfaceId || super.supportsInterface(interfaceId);
     }
 
     function initialize(address owner_, address operator_, IDepositContract depositContract_) external initializer {
@@ -186,24 +226,24 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         }
     }
 
-    function sharesOf(address account) external view returns (uint256) {
+    function sharesOf(address account) external view override returns (uint256) {
         return _shares[account];
     }
 
-    function balanceOf(address account) external view returns (uint256) {
+    function balanceOf(address account) public view override returns (uint256) {
         return _toBalance(_shares[account]);
     }
 
-    function pendingBalanceOf(address account) external view returns (uint256) {
+    function pendingBalanceOf(address account) external view override returns (uint256) {
         return _pendingWithdrawals[account];
     }
 
-    function claimableBalanceOf(address account) external view returns (uint256) {
+    function claimableBalanceOf(address account) external view override returns (uint256) {
         uint256 pendingWithdrawal = _pendingWithdrawals[account];
         return pendingWithdrawal > totalClaimable ? totalClaimable : pendingWithdrawal;
     }
 
-    function claim(uint256 amount, address beneficiary) external nonReentrant whenNotPaused {
+    function claim(uint256 amount, address beneficiary) external override nonReentrant whenNotPaused {
         if (beneficiary == address(0)) {
             revert InvalidAddress(beneficiary);
         }
@@ -227,7 +267,7 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         emit Claimed(account, beneficiary, amount);
     }
 
-    function totalAssets() public view returns (uint256) {
+    function totalAssets() public view override returns (uint256) {
         return totalStaked + totalUnstaked + totalClaimable - totalPendingWithdrawal;
     }
 
@@ -247,7 +287,7 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         return Math.mulDiv(amount, totalShares, totalAssets());
     }
 
-    function deposit(address beneficiary) public payable whenNotPaused {
+    function deposit(address beneficiary) public payable override whenNotPaused {
         if (beneficiary == address(0)) {
             revert InvalidAddress(beneficiary);
         }
@@ -265,13 +305,25 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
             revert DepositLimitExceeded(newTotalDeposits, depositLimit);
         }
         uint256 shares = _toShares(amount);
+        if (shares == 0) {
+            revert InvalidAmount(amount);
+        }
+        // burn minimum shares of first depositor to prevent share inflation and dust shares attacks.
+        if (totalShares == 0) {
+            if (shares < _MINIMUM_REQUIRED_SHARES) {
+                revert InvalidAmount(amount);
+            }
+            _shares[address(0)] = _MINIMUM_REQUIRED_SHARES;
+            totalShares += _MINIMUM_REQUIRED_SHARES;
+            shares -= _MINIMUM_REQUIRED_SHARES;
+        }
         _shares[beneficiary] += shares;
         totalShares += shares;
         totalUnstaked += amount;
         emit Deposited(account, beneficiary, amount);
     }
 
-    function withdraw(uint256 amount, address beneficiary) external nonReentrant whenNotPaused {
+    function withdraw(uint256 amount, address beneficiary) external override nonReentrant whenNotPaused {
         if (beneficiary == address(0)) {
             revert InvalidAddress(beneficiary);
         }
@@ -279,7 +331,13 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         if (amount == 0) {
             revert InvalidAmount(amount);
         }
+        if (amount > balanceOf(account)) {
+            revert InsufficientBalance(balanceOf(account), amount);
+        }
         uint256 shares = _toShares(amount);
+        if (shares == 0) {
+            revert InvalidAmount(amount);
+        }
         if (shares > _shares[account]) {
             revert InsufficientBalance(_shares[account], shares);
         }
@@ -306,7 +364,7 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         }
     }
 
-    function claimFees(uint256 amount, address beneficiary) external nonReentrant whenNotPaused {
+    function claimFees(uint256 amount, address beneficiary) external override nonReentrant whenNotPaused {
         if (beneficiary == address(0)) {
             revert InvalidAddress(beneficiary);
         }
@@ -344,7 +402,7 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         // account for completed withdrawals
         uint256 pendingWithdrawal = totalPendingWithdrawal - totalClaimable;
         uint256 completedWithdrawal = Math.min(
-            (balance - totalFees - totalUnstaked) / DEPOSIT_AMOUNT, // actual completed withdrawals
+            (balance - totalFees - totalUnstaked - totalClaimable) / DEPOSIT_AMOUNT, // actual completed withdrawals
             pendingWithdrawal / DEPOSIT_AMOUNT // pending withdrawals
                 + (pendingWithdrawal % DEPOSIT_AMOUNT == 0 ? 0 : 1) // partial withdrawals
         ) * DEPOSIT_AMOUNT;
@@ -418,6 +476,37 @@ contract Vault is OwnableUnset, ReentrancyGuardUpgradeable, PausableUpgradeable 
         }
         for (uint256 i = 0; i < length; i++) {
             registerValidator(pubkeys[i], signatures[i], depositDataRoots[i]);
+        }
+    }
+
+    function transferStake(address to, uint256 amount, bytes calldata data)
+        external
+        override
+        whenNotPaused
+        nonReentrant
+    {
+        address account = msg.sender;
+        if (amount == 0) {
+            revert InvalidAmount(amount);
+        }
+        if (amount > balanceOf(account)) {
+            revert InsufficientBalance(balanceOf(account), amount);
+        }
+        uint256 shares = _toShares(amount);
+        if (shares == 0) {
+            revert InvalidAmount(shares);
+        }
+        if (shares > _shares[account]) {
+            revert InsufficientBalance(_shares[account], shares);
+        }
+        if (to == address(0)) {
+            revert InvalidAddress(to);
+        }
+        _shares[account] -= shares;
+        _shares[to] += shares;
+        emit StakeTransferred(account, to, amount, data);
+        if (ERC165Checker.supportsInterface(to, type(IVaultStakeRecipient).interfaceId)) {
+            IVaultStakeRecipient(to).onVaultStakeReceived(account, amount, data);
         }
     }
 }
